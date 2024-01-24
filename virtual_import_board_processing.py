@@ -122,7 +122,10 @@ def load_mawb_dataframe(mawb_file) -> pd.DataFrame:
     pd.DataFrame:
         The MAWB xls file as a pandas dataframe.
     """
-    return pd.read_excel(mawb_file, dtype={"Ref: MAWB": str})
+
+    # The MAWB xls file contains a column "Target Delivery (Early)" that contains dates in the format "mm/dd/yyyy hh:mm".
+    date_parser = lambda x: pd.to_datetime(x.strip(), format='%m/%d/%Y %H:%M')
+    return pd.read_excel(mawb_file, dtype={"Ref: MAWB": str}, parse_dates=["Target Delivery (Early)"], date_format=date_parser)
 
 def load_shipper_site_dataframe(shipper_site_file) -> pd.DataFrame:
     """
@@ -140,7 +143,7 @@ def load_shipper_site_dataframe(shipper_site_file) -> pd.DataFrame:
     """
     return pd.read_excel(shipper_site_file)
 
-def process_mawb_dataframe(mawb_df: pd.DataFrame) -> pd.DataFrame:
+def process_mawb_dataframe(mawb_df: pd.DataFrame, consolidate: bool) -> pd.DataFrame:
     """
     Processes the MAWB dataframe and returns it.
     The resulting dataframe is filtered to only contain the following columns:
@@ -164,6 +167,9 @@ def process_mawb_dataframe(mawb_df: pd.DataFrame) -> pd.DataFrame:
     ----------
     mawb_df:
         The MAWB dataframe
+    
+    consolidate:
+        If True, rows that contain multiple Ref: Job Numbers are copied. If False, they remain as they are.
     
     Returns
     -------
@@ -208,9 +214,33 @@ def process_mawb_dataframe(mawb_df: pd.DataFrame) -> pd.DataFrame:
     # Drop rows where "Ref: MAWB" is empty or contains no data
     mawb_df.dropna(subset=["MAWB"], inplace=True)
 
-    # Copy all rows where "Ref: Job Number" contains multiple MAWB's
-    mawb_df["Job Number"] = mawb_df["Job Number"].str.split(",").apply(lambda x: [item.strip() for item in x])
-    mawb_df = mawb_df.explode("Job Number", ignore_index=True)
+    # Copy all rows where "Ref: Job Number" contains multiple Job Numbers if consolidate is False
+    # Print a warning if consolidate is True, as this is not very useful (?)
+    if not consolidate:
+        mawb_df["Job Number"] = mawb_df["Job Number"].str.split(",").apply(lambda x: [item.strip() for item in x])
+        mawb_df = mawb_df.explode("Job Number", ignore_index=True)
+    else:
+        print("WARNING: Consolidation is enabled. Rows that contain multiple Job Numbers are not copied.")
+
+    # Correct the state columns. Only state codes with a length of 2 are valid.
+    # All other values are set to None.
+    columns_to_check_state = ["Shipper Airport State", "Consignee Airport State"]
+    mawb_df[columns_to_check_state] = mawb_df[columns_to_check_state].map(
+        lambda item: item if isinstance(item, str) and len(item) == 2 else None
+    )
+
+    # Capitalize the first letter of each word in the "Consignee Airport Name" and "Shipper Airport City" column
+    columns_to_title = ["Shipper Airport City", "Consignee Airport Name", "Consignee Airport City", "Airline Name"]
+    mawb_df[columns_to_title] = mawb_df[columns_to_title].map(lambda x: x.title() if isinstance(x, str) else x)
+
+    # Compute the desired MAWB format
+    # We want the MAWB to consist of the first three letters, a dash, and the last eight letters.
+    # Use vectorized string slicing and concatenation to accelerate the process.
+    # Check if the MAWB is 11 characters long to prevent errors (8 + 3 = 11).
+    mawb_df.loc[mawb_df["MAWB"].notna() & (mawb_df["MAWB"].str.len() == 11), "MAWB"] = (
+        mawb_df["MAWB"].str[:3] + "-" + mawb_df["MAWB"].str[-8:]
+    )
+
     return mawb_df
 
 def process_shipper_site_dataframe(shipper_site_df: pd.DataFrame) -> pd.DataFrame:
@@ -256,9 +286,13 @@ def process_shipper_site_dataframe(shipper_site_df: pd.DataFrame) -> pd.DataFram
         "Actual Ship Unit Weight": "Ship Unit Weight",
         "Target Delivery (Range)": "Target Delivery Consignee",
     }, inplace=True)
+
+    # Capitalize the first letter of each word in the "Consignee City" column.
+    shipper_site_df["Consignee City"] = shipper_site_df["Consignee City"].apply(lambda x: x.title() if isinstance(x, str) else x)
+
     return shipper_site_df
     
-def create_virtual_import_board_dataframe(mawb_df: pd.DataFrame, shipper_site_df: pd.DataFrame) -> pd.DataFrame:
+def create_virtual_import_board_dataframe(mawb_df: pd.DataFrame, shipper_site_df: pd.DataFrame, consolidate: bool = False) -> pd.DataFrame:
     """
     Creates the virtual import board dataframe and returns it.
 
@@ -276,5 +310,10 @@ def create_virtual_import_board_dataframe(mawb_df: pd.DataFrame, shipper_site_df
         The virtual import board dataframe.
     
     """
+
+    # Process the dataframes
+    mawb_df = process_mawb_dataframe(mawb_df, consolidate)
+    shipper_site_df = process_shipper_site_dataframe(shipper_site_df)
+
     vib_df = pd.merge(mawb_df, shipper_site_df, left_on="Job Number", right_on="Job Number", how="inner")
     return vib_df
